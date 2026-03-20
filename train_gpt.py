@@ -93,10 +93,17 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
 
+    # Mixture of Softmax (MoS) output layer - breaks softmax bottleneck.
+    # At vocab=1024, dim=512, standard softmax has rank ≤ 513 (binding constraint).
+    # MoS with K=2 lifts this to rank ≤ 1026, enabling richer output distributions.
+    use_mos = bool(int(os.environ.get("USE_MOS", "0")))
+    mos_k = int(os.environ.get("MOS_K", 2))
+    mos_rank = int(os.environ.get("MOS_RANK", 64))  # 0 = full-rank, >0 = low-rank factorization
+
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
+#
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -658,6 +665,73 @@ class Block(nn.Module):
         return x
 
 
+class MixtureOfSoftmax(nn.Module):
+    """Mixture of Softmax output layer for breaking the softmax bottleneck.
+
+    At vocab=1024, dim=512, the standard softmax has rank ≤ 513.
+    MoS with K=2 lifts this to rank ≤ 1026, enabling richer output distributions.
+
+    When mos_rank > 0, uses low-rank factorization to save parameters:
+    instead of dim -> K*dim projection, uses dim -> rank -> K*dim.
+
+    Paper: Yang et al. (2018), "Breaking the Softmax Bottleneck", ICLR 2018.
+    """
+
+    def __init__(self, model_dim: int, vocab_size: int, n_mixtures: int = 2, rank: int = 0):
+        super().__init__()
+        self.n_mixtures = n_mixtures
+        self.model_dim = model_dim
+        self.vocab_size = vocab_size
+        self.rank = rank
+
+        if rank > 0:
+            # Low-rank factorization: dim -> rank -> K*dim
+            self.proj_down = CastedLinear(model_dim, rank, bias=False)
+            self.proj_up = CastedLinear(rank, n_mixtures * model_dim, bias=False)
+            nn.init.normal_(self.proj_down.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.proj_up.weight, mean=0.0, std=0.02)
+        else:
+            # Full-rank: dim -> K*dim
+            self.projections = CastedLinear(model_dim, n_mixtures * model_dim, bias=False)
+            nn.init.normal_(self.projections.weight, mean=0.0, std=0.02)
+
+        # Mixing weight predictor
+        self.gate = CastedLinear(model_dim, n_mixtures, bias=False)
+        nn.init.normal_(self.gate.weight, mean=0.0, std=0.02)
+
+    def forward(self, hidden: Tensor, weight_matrix: Tensor) -> Tensor:
+        """Compute mixed softmax distribution.
+
+        Args:
+            hidden: (bsz, seq_len, dim) - final hidden states
+            weight_matrix: (vocab_size, dim) - tied embedding weights
+
+        Returns:
+            log_probs: (bsz, seq_len, vocab_size) - mixed log probabilities
+        """
+        bsz, seq_len, dim = hidden.shape
+        K = self.n_mixtures
+
+        # Compute mixing weights: (bsz, seq, K)
+        pi = F.softmax(self.gate(hidden), dim=-1)
+
+        # Project to K different spaces: (bsz, seq, K * dim) -> (bsz, seq, K, dim)
+        if self.rank > 0:
+            projected = self.proj_up(self.proj_down(hidden)).view(bsz, seq_len, K, dim)
+        else:
+            projected = self.projections(hidden).view(bsz, seq_len, K, dim)
+
+        # Compute K different logit vectors: (bsz, seq, K, vocab)
+        logits = torch.einsum('bskd,vd->bskv', projected, weight_matrix)
+
+        # Mix softmax distributions using log-space for numerical stability
+        log_probs = F.log_softmax(logits, dim=-1)  # (bsz, seq, K, vocab)
+        log_pi = torch.log(pi.unsqueeze(-1) + 1e-10)  # (bsz, seq, K, 1)
+        mixed_log_probs = torch.logsumexp(log_probs + log_pi, dim=2)  # (bsz, seq, vocab)
+
+        return mixed_log_probs
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -672,6 +746,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_mos: bool = False,
+        mos_k: int = 2,
+        mos_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -679,6 +756,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.use_mos = use_mos
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -698,6 +776,11 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        # MoS output layer (optional) - breaks softmax bottleneck
+        if use_mos:
+            self.mos = MixtureOfSoftmax(model_dim, vocab_size, n_mixtures=mos_k, rank=mos_rank)
+        else:
+            self.mos = None
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -730,7 +813,18 @@ class GPT(nn.Module):
             vd = lora.v_loras[bi] if lora else None
             x = self.blocks[bi](x, x0, qd, vd)
         x = self.final_norm(x)
-        if self.tie_embeddings:
+        # Output layer
+        if self.mos is not None and self.tie_embeddings:
+            # MoS: returns log-probs (already log-softmaxed), use NLL loss directly
+            log_probs = self.mos(x, self.tok_emb.weight)
+            if lora:
+                # LoRA correction breaks normalization; re-normalize via log_softmax
+                log_probs = F.log_softmax(log_probs + lora.lm_head_lora(x), dim=-1)
+                bsz, sl, V = log_probs.shape
+                return F.nll_loss(
+                    log_probs.float().reshape(-1, V), target_ids.reshape(-1), reduction="none").reshape(bsz, sl)
+            return F.nll_loss(log_probs.float().reshape(-1, log_probs.size(-1)), target_ids.reshape(-1), reduction="mean")
+        elif self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
         else:
             logits = self.lm_head(x)
@@ -1065,6 +1159,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_mos=args.use_mos,
+        mos_k=args.mos_k,
+        mos_rank=args.mos_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1093,6 +1190,14 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # MoS parameters: 2D projection weights go to Muon, gate goes to scalar optimizer
+    if base_model.mos is not None:
+        if base_model.mos.rank > 0:
+            matrix_params.append(base_model.mos.proj_down.weight)
+            matrix_params.append(base_model.mos.proj_up.weight)
+        else:
+            matrix_params.append(base_model.mos.projections.weight)
+        scalar_params.append(base_model.mos.gate.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
