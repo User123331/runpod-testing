@@ -88,7 +88,7 @@ if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; 
     export FLASH_ATTENTION_DISABLE_CLUSTER=TRUE
     export FLASH_ATTENTION_DISABLE_HDIMDIFF64=TRUE
     export FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE
-    pip install -e .
+    pip install --no-build-isolation -e .
     cd "${SCRIPT_DIR}"
     log "FA3 build complete."
 else
