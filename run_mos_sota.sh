@@ -74,6 +74,7 @@ if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; 
     fi
     cd "${FA3_DIR}/hopper"
     rm -rf build/  # clear any stale full-build artifacts
+    mkdir -p flash_attn_3  # pip copies .so here; dir must exist
     # Only build bf16 hdim64 SM90 causal — skip everything else
     export FLASH_ATTENTION_DISABLE_FP16=TRUE
     export FLASH_ATTENTION_DISABLE_FP8=TRUE
