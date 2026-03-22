@@ -68,13 +68,12 @@ python3 -c "import huggingface_hub, zstandard" 2>/dev/null || \
 # Build FA3 (selective, ~5 min) if not already installed
 if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; then
     log "FA3 not found. Building selectively (~5 min)..."
-    if [ -d "/workspace/flash-attention" ]; then
-        FA3_DIR="/workspace/flash-attention"
-    else
-        git clone https://github.com/Dao-AILab/flash-attention.git /workspace/flash-attention
-        FA3_DIR="/workspace/flash-attention"
+    FA3_DIR="/workspace/flash-attention"
+    if [ ! -d "${FA3_DIR}" ]; then
+        git clone https://github.com/Dao-AILab/flash-attention.git "${FA3_DIR}"
     fi
     cd "${FA3_DIR}/hopper"
+    rm -rf build/  # clear any stale full-build artifacts
     # Only build bf16 hdim64 SM90 causal — skip everything else
     export FLASH_ATTENTION_DISABLE_FP16=TRUE
     export FLASH_ATTENTION_DISABLE_FP8=TRUE
