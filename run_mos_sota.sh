@@ -63,7 +63,7 @@ LOG_PATH="${LOG_DIR}/${RUN_ID}.log"
 
 # Ensure deps
 python3 -c "import huggingface_hub, zstandard, sentencepiece, numpy" 2>/dev/null || \
-    pip install --quiet huggingface_hub zstandard sentencepiece numpy
+    pip install --quiet huggingface_hub zstandard sentencepiece numpy --break-system-packages
 
 # Build FA3 (selective, ~5 min) if not already installed
 if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; then
@@ -93,7 +93,7 @@ if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; 
     export FLASH_ATTENTION_DISABLE_CLUSTER=TRUE
     export FLASH_ATTENTION_DISABLE_HDIMDIFF64=TRUE
     export FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE
-    pip install --no-build-isolation -e .
+    pip install --no-build-isolation --break-system-packages -e .
     cd "${SCRIPT_DIR}"
     log "FA3 build complete."
 else

@@ -37,7 +37,7 @@ if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; 
     cp -r flash_attn_3/*.py "${SITE_PACKAGES}/flash_attn_3/" 2>/dev/null || true
 
     # Install the interface package
-    pip install -e . --no-build-isolation 2>/dev/null || {
+    pip install -e . --no-build-isolation --break-system-packages 2>/dev/null || {
         cp flash_attn_interface.py "${SITE_PACKAGES}/" 2>/dev/null || true
     }
 
