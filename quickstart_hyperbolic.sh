@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # === Hyperbolic.ai Quick Start (Paste Into SSH) ===
 # Paste this entire block after SSHing into your 8x H100 instance
+# Uses PRE-COMPILED FA3 .so to skip the 5-min kernel compilation!
 
 set -euo pipefail
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
@@ -15,22 +16,38 @@ cd /workspace
 [ ! -d "parameter-golf" ] && git clone https://github.com/openai/parameter-golf.git
 [ ! -d "runpod-testing" ] && git clone https://github.com/User123331/runpod-testing.git
 
-# Build FA3 selectively
+# Install FA3 using pre-compiled .so + cloned Python interface
 if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; then
-    log "Building FA3 (~5 min)..."
+    log "Installing FA3 (pre-compiled .so + Python interface)..."
+
+    # Clone flash-attention repo for Python interface files
     [ ! -d "flash-attention" ] && git clone https://github.com/Dao-AILab/flash-attention.git
+
+    # Copy pre-compiled .so into place
+    cd /workspace/runpod-testing/"compiled FA3"
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    mkdir -p "${SITE_PACKAGES}/flash_attn_3"
+    cp _C.abi3.so "${SITE_PACKAGES}/flash_attn_3/"
+    cp flash_attn_config.py "${SITE_PACKAGES}/flash_attn_3/"
+
+    # Copy Python interface from flash-attention/hopper/flash_attn_3
     cd /workspace/flash-attention/hopper
-    rm -rf build/ && mkdir -p flash_attn_3
-    export FLASH_ATTENTION_DISABLE_FP16=TRUE FLASH_ATTENTION_DISABLE_FP8=TRUE
-    export FLASH_ATTENTION_DISABLE_HDIM96=TRUE FLASH_ATTENTION_DISABLE_HDIM128=TRUE
-    export FLASH_ATTENTION_DISABLE_HDIM192=TRUE FLASH_ATTENTION_DISABLE_HDIM256=TRUE
-    export FLASH_ATTENTION_DISABLE_SM80=TRUE FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE
-    export FLASH_ATTENTION_DISABLE_APPENDKV=TRUE FLASH_ATTENTION_DISABLE_SOFTCAP=TRUE
-    export FLASH_ATTENTION_DISABLE_PACKGQA=TRUE FLASH_ATTENTION_DISABLE_VARLEN=TRUE
-    export FLASH_ATTENTION_DISABLE_SPLIT=TRUE FLASH_ATTENTION_DISABLE_LOCAL=TRUE
-    export FLASH_ATTENTION_DISABLE_CLUSTER=TRUE FLASH_ATTENTION_DISABLE_HDIMDIFF64=TRUE
-    export FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE
-    pip install --no-build-isolation -e .
+    cp -r flash_attn_3/*.py "${SITE_PACKAGES}/flash_attn_3/" 2>/dev/null || true
+
+    # Install the interface package
+    pip install -e . --no-build-isolation 2>/dev/null || {
+        # If that fails, just copy the interface files manually
+        cp flash_attn_interface.py "${SITE_PACKAGES}/" 2>/dev/null || true
+    }
+
+    # Symlink flash_attn_config.py to torch path (fixes torch.compile backward crash)
+    TORCH_PATH=$(python3 -c "import torch; import os; print(os.path.dirname(torch.__file__))")
+    ln -sf "${SITE_PACKAGES}/flash_attn_3/flash_attn_config.py" "${TORCH_PATH}/flash_attn_config.py" 2>/dev/null || true
+
+    log "FA3 installed"
+    python3 -c "from flash_attn_interface import flash_attn_func; print('FA3: OK')" || {
+        log "WARNING: FA3 interface check failed, may need to build from source"
+    }
 fi
 
 # Download dataset
@@ -38,4 +55,11 @@ cd /workspace/parameter-golf
 log "Downloading dataset (8B tokens)..."
 python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80
 
-log "Setup complete! Ready for MoS experiments."
+log ""
+log "=== Setup Complete ==="
+log "GPUs: ${GPU_COUNT}"
+log "FA3: $(python3 -c 'from flash_attn_interface import flash_attn_func; print("OK")' 2>/dev/null || echo 'FAILED - will need to build')"
+log "Dataset: $(ls -1 data/datasets/fineweb10B_sp1024/fineweb_train_*.bin 2>/dev/null | wc -l) train shards"
+log ""
+log "Ready! Run experiments with:"
+log "  cd /workspace/runpod-testing && MODE=mos bash run_mos_sota.sh"
