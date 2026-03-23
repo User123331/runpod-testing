@@ -19,38 +19,45 @@ if [ ! -d "$HOME/parameter-golf" ]; then
     git clone https://github.com/openai/parameter-golf.git "$HOME/parameter-golf"
 fi
 
-# Install FA3 using pre-compiled .so
+# Build FA3 selectively (~5 min on H100)
 if ! python3 -c "from flash_attn_interface import flash_attn_func" 2>/dev/null; then
-    log "Installing FA3 from pre-compiled .so..."
+    log "Building Flash Attention 3 (selective, ~5 min)..."
 
-    # Clone flash-attention for Python interface
     if [ ! -d "$HOME/flash-attention" ]; then
         git clone https://github.com/Dao-AILab/flash-attention.git "$HOME/flash-attention"
     fi
 
-    # Use user site-packages (writable without sudo)
-    SITE_PACKAGES=$(python3 -c "import site; print(site.getusersitepackages())")
-    mkdir -p "${SITE_PACKAGES}"
-
-    # Copy pre-compiled .so
-    mkdir -p "${SITE_PACKAGES}/flash_attn_3"
-    cp "${SCRIPT_DIR}/compiled FA3/_C.abi3.so" "${SITE_PACKAGES}/flash_attn_3/"
-    cp "${SCRIPT_DIR}/compiled FA3/flash_attn_config.py" "${SITE_PACKAGES}/flash_attn_3/"
-
-    # Copy Python interface
-    cp "$HOME/flash-attention/hopper/flash_attn_3/"*.py "${SITE_PACKAGES}/flash_attn_3/" 2>/dev/null || true
-
-    # Install interface
     cd "$HOME/flash-attention/hopper"
-    pip install -e . --no-build-isolation --break-system-packages 2>/dev/null || true
+    rm -rf build/
+    mkdir -p flash_attn_3
+
+    # Only build bf16 hdim64 SM90 - skip everything else
+    export FLASH_ATTENTION_DISABLE_FP16=TRUE
+    export FLASH_ATTENTION_DISABLE_FP8=TRUE
+    export FLASH_ATTENTION_DISABLE_HDIM96=TRUE
+    export FLASH_ATTENTION_DISABLE_HDIM128=TRUE
+    export FLASH_ATTENTION_DISABLE_HDIM192=TRUE
+    export FLASH_ATTENTION_DISABLE_HDIM256=TRUE
+    export FLASH_ATTENTION_DISABLE_SM80=TRUE
+    export FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE
+    export FLASH_ATTENTION_DISABLE_APPENDKV=TRUE
+    export FLASH_ATTENTION_DISABLE_SOFTCAP=TRUE
+    export FLASH_ATTENTION_DISABLE_PACKGQA=TRUE
+    export FLASH_ATTENTION_DISABLE_VARLEN=TRUE
+    export FLASH_ATTENTION_DISABLE_SPLIT=TRUE
+    export FLASH_ATTENTION_DISABLE_LOCAL=TRUE
+    export FLASH_ATTENTION_DISABLE_CLUSTER=TRUE
+    export FLASH_ATTENTION_DISABLE_HDIMDIFF64=TRUE
+    export FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE
+
+    pip install --no-build-isolation --break-system-packages -e .
 
     # Symlink config to torch (fixes torch.compile backward crash)
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getusersitepackages())")
     TORCH_PATH=$(python3 -c "import torch; import os; print(os.path.dirname(torch.__file__))")
     ln -sf "${SITE_PACKAGES}/flash_attn_3/flash_attn_config.py" "${TORCH_PATH}/flash_attn_config.py" 2>/dev/null || true
 
-    python3 -c "from flash_attn_interface import flash_attn_func; print('FA3: OK')" || {
-        log "WARNING: FA3 check failed"
-    }
+    python3 -c "from flash_attn_interface import flash_attn_func; print('FA3: OK')"
 fi
 
 # Download dataset
